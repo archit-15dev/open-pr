@@ -1,0 +1,356 @@
+#!/bin/bash
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Function to show usage
+show_usage() {
+    cat << EOF
+Usage: open-pr <github_pr_url>
+
+This script will:
+1. Parse the GitHub PR URL to extract owner, repo, and PR number
+2. Check out the PR branch locally
+3. Pull and rebase the latest changes
+4. Get all modified files from the PR
+5. Open all modified files in Cursor
+
+Examples:
+    open-pr https://github.com/abnormal-security/source/pull/12345
+    open-pr https://github.com/owner/repo/pull/678
+
+Requirements:
+- gh CLI tool installed and authenticated
+- git repository in current directory
+- Cursor command line tool (cursor) available
+
+EOF
+}
+
+# Function to extract PR info from GitHub URL
+extract_pr_info() {
+    local url="$1"
+
+    # Support both full URLs and just PR numbers for current repo
+    if [[ "$url" =~ ^[0-9]+$ ]]; then
+        # Just a PR number, use current repository
+        local remote_url=$(git remote get-url origin 2>/dev/null)
+        if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+            echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} $url"
+            return 0
+        else
+            log_error "Could not determine repository from git remote"
+            return 1
+        fi
+    fi
+
+    # Parse full GitHub URL
+    if [[ "$url" =~ https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+        return 0
+    else
+        log_error "Invalid GitHub PR URL format"
+        log_error "Expected: https://github.com/owner/repo/pull/number"
+        return 1
+    fi
+}
+
+# Function to get GitHub token
+get_github_token() {
+    if [ -n "$GITHUB_TOKEN" ]; then
+        echo "$GITHUB_TOKEN"
+        return 0
+    fi
+
+    # Try to get token from gh CLI
+    if command -v gh &> /dev/null; then
+        local gh_token=$(gh auth token 2>/dev/null)
+        if [ -n "$gh_token" ]; then
+            echo "$gh_token"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Function to get PR details from GitHub API
+get_pr_details() {
+    local owner="$1"
+    local repo="$2"
+    local pr_number="$3"
+
+    local github_token=$(get_github_token)
+    if [ $? -ne 0 ]; then
+        log_error "Could not get GitHub token. Please run 'gh auth login'"
+        return 1
+    fi
+
+    local response=$(curl -s -H "Authorization: token $github_token" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/$owner/$repo/pulls/$pr_number")
+
+    # Check if the response contains an error
+    local error_message=$(echo "$response" | jq -r '.message // empty' 2>/dev/null)
+    if [ -n "$error_message" ]; then
+        log_error "GitHub API error: $error_message"
+        return 1
+    fi
+
+    echo "$response"
+    return 0
+}
+
+# Function to get list of modified files from PR
+get_pr_files() {
+    local owner="$1"
+    local repo="$2"
+    local pr_number="$3"
+
+    local github_token=$(get_github_token)
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    log_info "Fetching list of modified files..."
+
+    # Get files from GitHub API
+    local files_response=$(curl -s -H "Authorization: token $github_token" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/$owner/$repo/pulls/$pr_number/files")
+
+    # Extract filenames, excluding deleted files
+    echo "$files_response" | jq -r '.[] | select(.status != "removed") | .filename' 2>/dev/null
+}
+
+# Function to safely checkout PR branch
+checkout_pr_branch() {
+    local owner="$1"
+    local repo="$2"
+    local pr_number="$3"
+    local pr_details="$4"
+
+    # Extract branch information from PR details
+    local head_branch=$(echo "$pr_details" | jq -r '.head.ref')
+    local head_repo_full_name=$(echo "$pr_details" | jq -r '.head.repo.full_name')
+    local base_branch=$(echo "$pr_details" | jq -r '.base.ref')
+
+    if [ -z "$head_branch" ] || [ "$head_branch" = "null" ]; then
+        log_error "Could not extract branch information from PR"
+        return 1
+    fi
+
+    log_info "PR branch: $head_branch"
+    log_info "Base branch: $base_branch"
+
+    # Check if this is a fork or same repo
+    local current_repo_url=$(git remote get-url origin)
+    local is_fork=false
+
+    if [[ ! "$current_repo_url" =~ $head_repo_full_name ]]; then
+        is_fork=true
+        log_info "This is a fork PR from: $head_repo_full_name"
+    fi
+
+    # Stash any uncommitted changes
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        log_warn "You have uncommitted changes. Stashing them..."
+        git stash push -m "open-pr: Auto-stash before checkout at $(date)"
+    fi
+
+    # Fetch the latest changes from origin
+    log_info "Fetching latest changes from origin..."
+    git fetch origin
+
+    if [ "$is_fork" = true ]; then
+        # For fork PRs, we need to add the fork as a remote and fetch from it
+        local fork_remote="fork-$pr_number"
+        local fork_url="https://github.com/$head_repo_full_name.git"
+
+        # Add fork remote if it doesn't exist
+        if ! git remote | grep -q "^$fork_remote$"; then
+            log_info "Adding fork remote: $fork_remote"
+            git remote add "$fork_remote" "$fork_url"
+        fi
+
+        # Fetch from fork
+        log_info "Fetching from fork..."
+        git fetch "$fork_remote"
+
+        # Create local branch tracking the fork branch
+        local local_branch="pr-$pr_number-$head_branch"
+        if git show-ref --verify --quiet "refs/heads/$local_branch"; then
+            log_info "Checking out existing branch: $local_branch"
+            git checkout "$local_branch"
+            git pull "$fork_remote" "$head_branch"
+        else
+            log_info "Creating new branch: $local_branch"
+            git checkout -b "$local_branch" "$fork_remote/$head_branch"
+        fi
+    else
+        # For same-repo PRs, just checkout the branch
+        if git show-ref --verify --quiet "refs/heads/$head_branch"; then
+            log_info "Checking out existing branch: $head_branch"
+            git checkout "$head_branch"
+            git pull origin "$head_branch"
+        else
+            # Try to checkout remote branch
+            if git show-ref --verify --quiet "refs/remotes/origin/$head_branch"; then
+                log_info "Creating local branch tracking origin/$head_branch"
+                git checkout -b "$head_branch" "origin/$head_branch"
+            else
+                log_error "Branch $head_branch not found in remote"
+                return 1
+            fi
+        fi
+    fi
+
+    # Optionally rebase onto base branch
+    if [ "$base_branch" != "$head_branch" ]; then
+        log_info "Rebasing onto $base_branch..."
+        if ! git rebase "origin/$base_branch"; then
+            log_warn "Rebase failed. You may need to resolve conflicts manually."
+            log_info "Current branch is ready for you to work on."
+        fi
+    fi
+
+    log_success "Successfully checked out PR branch"
+    return 0
+}
+
+# Function to open files in Cursor
+open_files_in_cursor() {
+    local files=("$@")
+
+    if [ ${#files[@]} -eq 0 ]; then
+        log_warn "No files to open"
+        return 0
+    fi
+
+    # Check if cursor command is available
+    if ! command -v cursor &> /dev/null; then
+        log_error "Cursor command 'cursor' not found. Please install Cursor command line tools."
+        log_info "You can install them from Cursor: Cmd+Shift+P -> 'Shell Command: Install 'cursor' command in PATH'"
+        return 1
+    fi
+
+    log_info "Opening ${#files[@]} files in Cursor..."
+
+    # Filter out files that don't exist (might be deleted or renamed)
+    local existing_files=()
+    for file in "${files[@]}"; do
+        if [ -f "$file" ]; then
+            existing_files+=("$file")
+        else
+            log_warn "File not found (might be deleted/renamed): $file"
+        fi
+    done
+
+    if [ ${#existing_files[@]} -eq 0 ]; then
+        log_warn "No existing files found to open"
+        return 0
+    fi
+
+    # Open files in Cursor
+    cursor "${existing_files[@]}"
+    log_success "Opened ${#existing_files[@]} files in Cursor"
+
+    # Show a summary
+    echo ""
+    log_info "Files opened:"
+    for file in "${existing_files[@]}"; do
+        echo "  - $file"
+    done
+}
+
+# Main function
+main() {
+    local pr_url="$1"
+
+    if [ -z "$pr_url" ]; then
+        show_usage
+        exit 1
+    fi
+
+    # Check prerequisites
+    if ! command -v gh &> /dev/null; then
+        log_error "GitHub CLI (gh) is required but not installed"
+        log_info "Install with: brew install gh"
+        exit 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is required but not installed"
+        log_info "Install with: brew install jq"
+        exit 1
+    fi
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        log_error "Not in a git repository"
+        exit 1
+    fi
+
+    # Extract PR information
+    log_info "Parsing GitHub PR URL..."
+    local pr_info=$(extract_pr_info "$pr_url")
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+
+    read -r owner repo pr_number <<< "$pr_info"
+    log_info "Repository: $owner/$repo"
+    log_info "PR Number: $pr_number"
+
+    # Get PR details
+    log_info "Fetching PR details from GitHub..."
+    local pr_details=$(get_pr_details "$owner" "$repo" "$pr_number")
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
+
+    # Extract PR title for display
+    local pr_title=$(echo "$pr_details" | jq -r '.title')
+    log_info "PR Title: $pr_title"
+
+    # Get list of modified files
+    local modified_files=($(get_pr_files "$owner" "$repo" "$pr_number"))
+    if [ ${#modified_files[@]} -eq 0 ]; then
+        log_warn "No modified files found in this PR"
+    else
+        log_info "Found ${#modified_files[@]} modified files"
+    fi
+
+    # Checkout PR branch
+    if ! checkout_pr_branch "$owner" "$repo" "$pr_number" "$pr_details"; then
+        exit 1
+    fi
+
+    # Open files in Cursor
+    if [ ${#modified_files[@]} -gt 0 ]; then
+        open_files_in_cursor "${modified_files[@]}"
+    fi
+
+    echo ""
+    log_success "PR $pr_number is ready for review!"
+    log_info "You can now start working on: $pr_title"
+}
+
+# Handle help flag
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    show_usage
+    exit 0
+fi
+
+# Run main function
+main "$@"
