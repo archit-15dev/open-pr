@@ -21,14 +21,16 @@ Usage: open-pr <github_pr_url>
 
 This script will:
 1. Parse the GitHub PR URL to extract owner, repo, and PR number
-2. Check out the PR branch locally
-3. Pull and rebase the latest changes
-4. Get all modified files from the PR
-5. Open all modified files in Cursor
+2. Check if branch already exists locally
+3. If exists: checkout and sync with remote (NO REBASE)
+4. If not exists: checkout PR branch from remote
+5. Get all modified files from the PR
+6. Open all modified files in Cursor
 
 Examples:
     open-pr https://github.com/abnormal-security/source/pull/12345
     open-pr https://github.com/owner/repo/pull/678
+    open-pr 12345  # For current repository
 
 Requirements:
 - gh CLI tool installed and authenticated
@@ -134,7 +136,7 @@ get_pr_files() {
     echo "$files_response" | jq -r '.[] | select(.status != "removed") | .filename' 2>/dev/null
 }
 
-# Function to safely checkout PR branch
+# Function to safely checkout PR branch with improved logic
 checkout_pr_branch() {
     local owner="$1"
     local repo="$2"
@@ -177,6 +179,7 @@ checkout_pr_branch() {
         # For fork PRs, we need to add the fork as a remote and fetch from it
         local fork_remote="fork-$pr_number"
         local fork_url="https://github.com/$head_repo_full_name.git"
+        local local_branch="pr-$pr_number-$head_branch"
 
         # Add fork remote if it doesn't exist
         if ! git remote | grep -q "^$fork_remote$"; then
@@ -188,22 +191,36 @@ checkout_pr_branch() {
         log_info "Fetching from fork..."
         git fetch "$fork_remote"
 
-        # Create local branch tracking the fork branch
-        local local_branch="pr-$pr_number-$head_branch"
+        # Check if local branch already exists
         if git show-ref --verify --quiet "refs/heads/$local_branch"; then
-            log_info "Checking out existing branch: $local_branch"
+            log_info "Local branch '$local_branch' exists. Checking out and syncing..."
             git checkout "$local_branch"
+
+            # Sync with the remote fork branch (NO REBASE)
+            log_info "Syncing with remote fork branch..."
             git pull "$fork_remote" "$head_branch"
         else
             log_info "Creating new branch: $local_branch"
             git checkout -b "$local_branch" "$fork_remote/$head_branch"
         fi
     else
-        # For same-repo PRs, just checkout the branch
+        # For same-repo PRs - improved logic
+        # Check if local branch already exists
         if git show-ref --verify --quiet "refs/heads/$head_branch"; then
-            log_info "Checking out existing branch: $head_branch"
+            log_info "Local branch '$head_branch' exists. Checking out and syncing..."
             git checkout "$head_branch"
-            git pull origin "$head_branch"
+
+            # Check if branch has upstream tracking
+            local upstream=$(git rev-parse --abbrev-ref "$head_branch@{upstream}" 2>/dev/null || echo "")
+
+            if [ -n "$upstream" ]; then
+                log_info "Syncing with upstream: $upstream"
+                git pull
+            else
+                log_info "Setting upstream and pulling from origin/$head_branch"
+                git branch --set-upstream-to="origin/$head_branch" "$head_branch"
+                git pull origin "$head_branch"
+            fi
         else
             # Try to checkout remote branch
             if git show-ref --verify --quiet "refs/remotes/origin/$head_branch"; then
@@ -216,16 +233,25 @@ checkout_pr_branch() {
         fi
     fi
 
-    # Optionally rebase onto base branch
-    if [ "$base_branch" != "$head_branch" ]; then
-        log_info "Rebasing onto $base_branch..."
-        if ! git rebase "origin/$base_branch"; then
-            log_warn "Rebase failed. You may need to resolve conflicts manually."
-            log_info "Current branch is ready for you to work on."
-        fi
+    # NO AUTOMATIC REBASE - just report the status
+    log_info "Branch status relative to $base_branch:"
+    local ahead_behind=$(git rev-list --left-right --count "origin/$base_branch...$head_branch" 2>/dev/null || echo "0	0")
+    local ahead=$(echo "$ahead_behind" | cut -f2)
+    local behind=$(echo "$ahead_behind" | cut -f1)
+
+    if [ "$behind" -gt 0 ]; then
+        log_info "Branch is $behind commits behind $base_branch"
+    fi
+    if [ "$ahead" -gt 0 ]; then
+        log_info "Branch is $ahead commits ahead of $base_branch"
     fi
 
-    log_success "Successfully checked out PR branch"
+    if [ "$behind" -gt 0 ]; then
+        log_info "If you want to update with latest $base_branch, run: git merge origin/$base_branch"
+        log_info "Or if you prefer rebase: git rebase origin/$base_branch"
+    fi
+
+    log_success "Successfully checked out PR branch (no automatic rebase performed)"
     return 0
 }
 
