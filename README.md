@@ -12,12 +12,12 @@ Instantly open GitHub PRs in your editor with all modified files ready for revie
 ## Installation
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/archits26/open-pr/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/archit-15dev/open-pr/main/install.sh | bash
 ```
 
 Or manually:
 ```bash
-curl -o ~/.local/bin/open-pr https://raw.githubusercontent.com/archits26/open-pr/main/open-pr
+curl -o ~/.local/bin/open-pr https://raw.githubusercontent.com/archit-15dev/open-pr/main/open-pr
 chmod +x ~/.local/bin/open-pr
 ```
 

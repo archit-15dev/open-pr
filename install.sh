@@ -8,7 +8,7 @@ mkdir -p ~/.local/bin
 
 # Download the script
 echo "⬇️  Downloading open-pr script..."
-curl -fsSL https://raw.githubusercontent.com/archits26/open-pr/main/open-pr -o ~/.local/bin/open-pr
+curl -fsSL https://raw.githubusercontent.com/archit-15dev/open-pr/main/open-pr -o ~/.local/bin/open-pr
 
 # Make it executable
 chmod +x ~/.local/bin/open-pr
